@@ -1,23 +1,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const bun = @import("root").bun;
+const validators = @import("./util/validators.zig");
 const strings = bun.strings;
 const string = bun.string;
-const JSC = @import("root").bun.JSC;
+const JSC = bun.JSC;
 const PathString = JSC.PathString;
 const Environment = bun.Environment;
 const C = bun.C;
 const Syscall = bun.sys;
 const os = std.os;
-pub const Buffer = JSC.MarkedArrayBuffer;
 const IdentityContext = @import("../../identity_context.zig").IdentityContext;
-const logger = @import("root").bun.logger;
+const logger = bun.logger;
 const Fs = @import("../../fs.zig");
 const URL = @import("../../url.zig").URL;
 const Shimmer = @import("../bindings/shimmer.zig").Shimmer;
 const is_bindgen: bool = std.meta.globalOption("bindgen", bool) orelse false;
-const resolve_path = @import("../../resolver/resolve_path.zig");
+const path_handler = bun.path;
 const meta = bun.meta;
+const validateString = validators.validateString;
+
+pub const Buffer = JSC.MarkedArrayBuffer;
 
 /// On windows, this is what libuv expects
 /// On unix it is what the utimens api expects
@@ -634,7 +637,7 @@ pub const PathLike = union(enum) {
         };
     }
 
-    pub fn sliceZWithForceCopy(this: PathLike, buf: *[bun.MAX_PATH_BYTES]u8, comptime force: bool) [:0]const u8 {
+    pub fn sliceZWithForceCopy(this: PathLike, buf: *bun.PathBuffer, comptime force: bool) [:0]const u8 {
         const sliced = this.slice();
 
         if (sliced.len == 0) return "";
@@ -651,22 +654,22 @@ pub const PathLike = union(enum) {
         return buf[0..sliced.len :0];
     }
 
-    pub inline fn sliceZ(this: PathLike, buf: *[bun.MAX_PATH_BYTES]u8) [:0]const u8 {
+    pub inline fn sliceZ(this: PathLike, buf: *bun.PathBuffer) [:0]const u8 {
         if (Environment.isWindows) {
             const data = this.slice();
             if (!std.fs.path.isAbsolute(data)) {
                 return sliceZWithForceCopy(this, buf, false);
             }
-            return resolve_path.PosixToWinNormalizer.resolveCWDWithExternalBufZ(buf, data) catch @panic("Error while resolving path.");
+            return path_handler.PosixToWinNormalizer.resolveCWDWithExternalBufZ(buf, data) catch @panic("Error while resolving path.");
         }
         return sliceZWithForceCopy(this, buf, false);
     }
 
-    pub inline fn sliceW(this: PathLike, buf: *[bun.MAX_PATH_BYTES]u8) [:0]const u16 {
+    pub inline fn sliceW(this: PathLike, buf: *bun.PathBuffer) [:0]const u16 {
         return bun.strings.toWPath(@alignCast(std.mem.bytesAsSlice(u16, buf)), this.slice());
     }
 
-    pub inline fn osPath(this: PathLike, buf: *[bun.MAX_PATH_BYTES]u8) bun.OSPathSliceZ {
+    pub inline fn osPath(this: PathLike, buf: *bun.PathBuffer) bun.OSPathSliceZ {
         if (comptime Environment.isWindows) {
             return sliceW(this, buf);
         }
@@ -922,7 +925,7 @@ pub const VectorArrayBuffer = struct {
 pub const ArgumentsSlice = struct {
     remaining: []const JSC.JSValue,
     vm: *JSC.VirtualMachine,
-    arena: @import("root").bun.ArenaAllocator = @import("root").bun.ArenaAllocator.init(bun.default_allocator),
+    arena: bun.ArenaAllocator = bun.ArenaAllocator.init(bun.default_allocator),
     all: []const JSC.JSValue,
     threw: bool = false,
     protected: std.bit_set.IntegerBitSet(32) = std.bit_set.IntegerBitSet(32).initEmpty(),
@@ -963,7 +966,7 @@ pub const ArgumentsSlice = struct {
             .remaining = arguments,
             .vm = vm,
             .all = arguments,
-            .arena = @import("root").bun.ArenaAllocator.init(vm.allocator),
+            .arena = bun.ArenaAllocator.init(vm.allocator),
         };
     }
 
@@ -1062,7 +1065,7 @@ pub fn modeFromJS(ctx: JSC.C.JSContextRef, value: JSC.JSValue, exception: JSC.C.
         //        the example), specifies permissions for the group. The right-most
         //        digit (5 in the example), specifies the permissions for others.
 
-        var zig_str = JSC.ZigString.init("");
+        var zig_str = JSC.ZigString.Empty;
         value.toZigString(&zig_str, ctx.ptr());
         var slice = zig_str.slice();
         if (strings.hasPrefix(slice, "0o")) {
@@ -1821,9 +1824,8 @@ pub const Path = struct {
     pub const name = "Bun__Path";
     pub const include = "Path.h";
     pub const namespace = shim.namespace;
-    const PathHandler = @import("../../resolver/resolve_path.zig");
+    const isSepAny = path_handler.isSepAny;
     const StringBuilder = @import("../../string_builder.zig");
-    pub const code = @embedFile("../path.exports.js");
 
     pub fn create(globalObject: *JSC.JSGlobalObject, isWindows: bool) callconv(.C) JSC.JSValue {
         return shim.cppFn("create", .{ globalObject, isWindows });
@@ -1861,84 +1863,143 @@ pub const Path = struct {
         return JSC.ZigString.init(out).withEncoding().toValueGC(globalThis);
     }
 
-    fn dirnameWindows(path: []const u8) []const u8 {
-        if (path.len == 0)
+    // Based on Node's path.posix.dirname:
+    // https://github.com/nodejs/node/blob/6ae20aa63de78294b18d5015481485b7cd8fbb60/lib/path.js#L1278
+    fn dirnamePosix(path: []const u8) []const u8 {
+        // validateString is performed in fn pub dirname.
+        if (path.len == 0) {
             return ".";
-
-        const root_slice = std.fs.path.diskDesignatorWindows(path);
-        if (path.len == root_slice.len)
-            return root_slice;
-
-        const have_root_slash = path.len > root_slice.len and (path[root_slice.len] == '/' or path[root_slice.len] == '\\');
-
-        var end_index: usize = path.len - 1;
-
-        while (path[end_index] == '/' or path[end_index] == '\\') {
-            // e.g. '\\' => "\\"
-            if (end_index == 0) {
-                return path[0..1];
-            }
-            end_index -= 1;
         }
 
-        while (path[end_index] != '/' and path[end_index] != '\\') {
-            if (end_index == 0) {
-                if (root_slice.len == 0) {
-                    return ".";
+        const hasRoot = path[0] == '/';
+        var end: i64 = -1;
+        var matchedSlash: bool = true;
+        var i: i64 = @as(i64, @intCast(path.len - 1));
+        while (i >= 1) : (i -= 1) {
+            if (path[@as(usize, @intCast(i))] == '/') {
+                if (!matchedSlash) {
+                    end = i;
+                    break;
                 }
-                if (have_root_slash) {
-                    // e.g. "c:\\" => "c:\\"
-                    return path[0 .. root_slice.len + 1];
-                } else {
-                    // e.g. "c:foo" => "c:"
-                    return root_slice;
-                }
+            } else {
+                // We saw the first non-path separator
+                matchedSlash = false;
             }
-            end_index -= 1;
         }
 
-        if (have_root_slash and end_index == root_slice.len) {
-            end_index += 1;
+        if (end == -1) {
+            return if (hasRoot) "/" else ".";
         }
 
-        return path[0..end_index];
+        if (hasRoot and end == 1) {
+            return "//";
+        }
+
+        return path[0 ..@as(usize, @intCast(end))];
     }
 
-    fn dirnamePosix(path: []const u8) []const u8 {
-        if (path.len == 0)
+    // Based on Node's path.win32.dirname:
+    // https://github.com/nodejs/node/blob/6ae20aa63de78294b18d5015481485b7cd8fbb60/lib/path.js#L657
+    fn dirnameWindows(path: []const u8) []const u8 {
+        // validateString is performed in fn pub dirname.
+        const len = path.len;
+
+        if (len == 0) {
             return ".";
-
-        var end_index: usize = path.len - 1;
-
-        while (path[end_index] == '/') {
-            // e.g. "////" => "/"
-            if (end_index == 0) {
-                return "/";
-            }
-            end_index -= 1;
         }
 
-        while (path[end_index] != '/') {
-            if (end_index == 0) {
-                // e.g. "a/", "a"
+        var rootEnd: i64 = -1;
+        var offset: i64 = 0;
+        const byte0 = path[0];
+
+        if (len == 1) {
+            // `path` contains just a path separator, exit early to avoid
+            // unnecessary work or a dot.
+            return if (isSepAny(byte0)) path else ".";
+        }
+
+        // Try to match a root
+        if (isSepAny(byte0)) {
+            // Possible UNC root
+
+            rootEnd = 1;
+            offset = 1;
+
+            if (isSepAny(path[1])) {
+                // Matched double path separator at the beginning
+                var j: usize = 2;
+                var last: usize = j;
+
+                // Match 1 or more non-path separators
+                while (j < len and !isSepAny(path[j])) {
+                    j += 1;
+                }
+
+                if (j < len and j != last) {
+                    // Matched!
+                    last = j;
+
+                    // Match 1 or more path separators
+                    while (j < len and isSepAny(path[j])) {
+                        j += 1;
+                    }
+
+                    if (j < len and j != last) {
+                        // Matched!
+                        last = j;
+
+                        // Match 1 or more non-path separators
+                        while (j < len and !isSepAny(path[j])) {
+                            j += 1;
+                        }
+
+                        if (j == len) {
+                            // We matched a UNC root only
+                            return path;
+                        }
+
+                        if (j != last) {
+                            // We matched a UNC root with leftovers
+
+                            // Offset by 1 to include the separator after the UNC root to
+                            // treat it as a "normal root" on top of a (UNC) root
+                            rootEnd = @as(i64, @intCast(j + 1));
+                            offset = rootEnd;
+                        }
+                    }
+                }
+            }
+        // Possible device root
+        } else if (isWindowsDeviceRoot(byte0) and path[1] == ':') {
+            rootEnd = if (len > 2 and isSepAny(path[2])) 3 else 2;
+            offset = rootEnd;
+        }
+
+        var end: isize = -1;
+        var matchedSlash: bool = true;
+
+        var i: i64 = @as(i64, @intCast(len - 1));
+        while (i >= offset) : (i -= 1) {
+            if (isSepAny(path[@as(usize, @intCast(i))])) {
+                if (!matchedSlash) {
+                    end = i;
+                    break;
+                }
+            } else {
+                // We saw the first non-path separator
+                matchedSlash = false;
+            }
+        }
+
+        if (end == -1) {
+            if (rootEnd == -1) {
                 return ".";
             }
-            end_index -= 1;
+
+            end = rootEnd;
         }
 
-        // e.g. "/a/" => "/"
-        if (end_index == 0 and path[0] == '/') {
-            return "/";
-        }
-
-        // "a/b" => "a" or "//b" => "//"
-        if (end_index <= 1) {
-            if (path[0] == '/' and path[1] == '/') {
-                end_index += 1;
-            }
-        }
-
-        return path[0..end_index];
+        return path[0..@as(usize, @intCast(end))];
     }
 
     pub fn dirname(globalThis: *JSC.JSGlobalObject, isWindows: bool, args_ptr: [*]JSC.JSValue, args_len: u16) callconv(.C) JSC.JSValue {
@@ -1949,16 +2010,17 @@ pub const Path = struct {
         var stack_fallback = std.heap.stackFallback(4096, JSC.getAllocator(globalThis));
         const allocator = stack_fallback.get();
 
-        var arguments: []JSC.JSValue = args_ptr[0..args_len];
-        var path = arguments[0].toSlice(globalThis, allocator);
+        const pathJSValue = args_ptr[0];
+        // Doesn't throw an exception in zig. It does trigger it in JS land.
+        validateString(globalThis, pathJSValue, "path", .{}) catch {};
+
+        var path = pathJSValue.toSlice(globalThis, allocator);
         defer path.deinit();
 
-        const base_slice = path.slice();
-
         const out = if (isWindows)
-            @This().dirnameWindows(base_slice)
+            @This().dirnameWindows(path.slice())
         else
-            @This().dirnamePosix(base_slice);
+            @This().dirnamePosix(path.slice());
 
         return JSC.ZigString.init(out).withEncoding().toValueGC(globalThis);
     }
@@ -2103,6 +2165,12 @@ pub const Path = struct {
         return JSC.JSValue.jsBoolean(zig_str.len > 0 and isAbsoluteString(zig_str, isWindows));
     }
 
+    // Based on Node's path.isWindowsDeviceRoot:
+    // https://github.com/nodejs/node/blob/6ae20aa63de78294b18d5015481485b7cd8fbb60/lib/path.js#L60C10-L60C29
+    fn isWindowsDeviceRoot(byte: u8) bool {
+        return (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z');
+    }
+
     fn isZigStringAbsoluteWindows(zig_str: JSC.ZigString) bool {
         std.debug.assert(zig_str.len > 0); // caller must check
         if (zig_str.is16Bit()) {
@@ -2132,7 +2200,7 @@ pub const Path = struct {
     ) callconv(.C) JSC.JSValue {
         if (comptime is_bindgen) return JSC.JSValue.jsUndefined();
         if (args_len == 0) return JSC.ZigString.init(".").toValue(globalThis);
-        var arena = @import("root").bun.ArenaAllocator.init(heap_allocator);
+        var arena = bun.ArenaAllocator.init(heap_allocator);
         defer arena.deinit();
 
         const arena_allocator = arena.allocator();
@@ -2142,9 +2210,9 @@ pub const Path = struct {
         );
         var allocator = stack_fallback_allocator.get();
 
-        var buf: [bun.MAX_PATH_BYTES]u8 = undefined;
+        var buf: bun.PathBuffer = undefined;
         var count: usize = 0;
-        var i: u16 = 0;
+        var i: usize = 0;
         var to_join = allocator.alloc(string, args_len) catch unreachable;
         for (args_ptr[0..args_len]) |arg| {
             const zig_str: JSC.ZigString = arg.getZigString(globalThis);
@@ -2168,9 +2236,9 @@ pub const Path = struct {
         }
 
         const out = if (!isWindows)
-            PathHandler.joinStringBuf(buf_to_use, to_join[0..i], .posix)
+            path_handler.joinStringBuf(buf_to_use, to_join[0..i], .posix)
         else
-            PathHandler.joinStringBuf(buf_to_use, to_join[0..i], .windows);
+            path_handler.joinStringBuf(buf_to_use, to_join[0..i], .windows);
 
         var str = bun.String.createUTF8(out);
         defer str.deref();
@@ -2184,15 +2252,15 @@ pub const Path = struct {
         var zig_str: JSC.ZigString = args_ptr[0].getZigString(globalThis);
         if (zig_str.len == 0) return JSC.ZigString.init(".").toValue(globalThis);
 
-        var buf: [bun.MAX_PATH_BYTES]u8 = undefined;
+        var buf: bun.PathBuffer = undefined;
         var str_slice = zig_str.toSlice(heap_allocator);
         defer str_slice.deinit();
         const str = str_slice.slice();
 
         const out = if (!isWindows)
-            PathHandler.normalizeStringNode(str, &buf, .posix)
+            path_handler.normalizeStringNode(str, &buf, .posix)
         else
-            PathHandler.normalizeStringNode(str, &buf, .windows);
+            path_handler.normalizeStringNode(str, &buf, .windows);
 
         var out_str = JSC.ZigString.init(out);
         if (str_slice.isAllocated()) out_str.setOutputEncoding();
@@ -2319,46 +2387,394 @@ pub const Path = struct {
         const to = to_slice.slice();
 
         const out = if (!isWindows)
-            PathHandler.relativePlatform(from, to, .posix, true)
+            path_handler.relativePlatform(from, to, .posix, true)
         else
-            PathHandler.relativePlatform(from, to, .windows, true);
+            path_handler.relativePlatform(from, to, .windows, true);
 
         var out_str = JSC.ZigString.init(out);
         if (from_slice.isAllocated() or to_slice.isAllocated()) out_str.setOutputEncoding();
         return out_str.toValueGC(globalThis);
     }
 
-    pub fn resolve(globalThis: *JSC.JSGlobalObject, isWindows: bool, args_ptr: [*]JSC.JSValue, args_len: u16) callconv(.C) JSC.JSValue {
-        if (comptime is_bindgen) return JSC.JSValue.jsUndefined();
-
-        var stack_fallback_allocator = std.heap.stackFallback(
-            (32 * @sizeOf(string)),
-            heap_allocator,
-        );
-        var allocator = stack_fallback_allocator.get();
-        var out_buf: [bun.MAX_PATH_BYTES * 2]u8 = undefined;
-
-        var parts = allocator.alloc(string, args_len) catch unreachable;
-        defer allocator.free(parts);
+    // Based on Node's path.posix.resolve
+    // https://github.com/nodejs/node/blob/6ae20aa63de78294b18d5015481485b7cd8fbb60/lib/path.js#L1095
+    fn resolvePosix(paths: []const []const u8) []const u8 {
+        var resolvedPath: []const u8 = "";
+        var resolvedAbsolute: bool = false;
+        const cwd = Fs.FileSystem.instance.top_level_dir;
 
         var arena = bun.ArenaAllocator.init(heap_allocator);
         const arena_allocator = arena.allocator();
         defer arena.deinit();
 
-        var i: u16 = 0;
-        while (i < args_len) : (i += 1) {
-            parts[i] = args_ptr[i].toSlice(globalThis, arena_allocator).slice();
+        var i: i64 = @as(i64, @intCast(paths.len - 1));
+        while (i >= -1) : (i -= 1) {
+            var path: []const u8 = "";
+            if (i >= 0) {
+                path = paths[@as(usize, @intCast(i))];
+            } else {
+                path = cwd;
+            }
+            // validateString is performed in fn pub resolve.
+
+            // Skip empty entries
+            if (path.len == 0) continue;
+
+            // Translated from the following JS code:
+            // resolvedPath = `${path}/${resolvedPath}`;
+            var buf: bun.PathBuffer = undefined;
+            var bufOffset: usize = 0;
+            var bufSize: usize = path.len;
+            @memcpy(buf[bufOffset ..bufSize], path);
+            bufOffset = bufSize;
+            bufSize += 1;
+            @memcpy(buf[bufOffset ..bufSize], "/");
+            bufOffset = bufSize;
+            bufSize += resolvedPath.len;
+            @memcpy(buf[bufOffset ..bufSize], resolvedPath);
+            resolvedPath = buf[0 ..];
+            resolvedAbsolute = path[0] == '/';
         }
 
-        var out: JSC.ZigString = if (!isWindows)
-            JSC.ZigString.init(strings.withoutTrailingSlash(PathHandler.joinAbsStringBuf(Fs.FileSystem.instance.top_level_dir, &out_buf, parts, .posix)))
-        else
-            JSC.ZigString.init(strings.withoutTrailingSlashWindowsPath(PathHandler.joinAbsStringBuf(Fs.FileSystem.instance.top_level_dir, &out_buf, parts, .windows)));
+        // At this point the path should be resolved to a full absolute path, but
+        // handle relative paths to be safe (might happen when process.cwd() fails)
 
-        if (arena.state.buffer_list.first != null)
-            out.setOutputEncoding();
+        // Normalize the path
+        resolvedPath = std.fs.path.resolvePosix(arena_allocator, &.{ resolvedPath }) catch "";
+        defer arena_allocator.free(resolvedPath);
 
-        return out.toValueGC(globalThis);
+        // Translated from the following JS code:
+        // if (resolvedAbsolute) {
+        //   return `/${resolvedPath}`;
+        // }
+        if (resolvedAbsolute) {
+            var buf: bun.PathBuffer = undefined;
+            var bufOffset: usize = 0;
+            var bufSize: usize = 1;
+            @memcpy(buf[bufOffset ..bufSize], "/");
+            bufOffset = bufSize;
+            bufSize += resolvedPath.len;
+            @memcpy(buf[bufOffset ..bufSize], resolvedPath);
+            return buf[0 ..];
+        }
+        // Translated from the following JS code:
+        // return resolvedPath.length > 0 ? resolvedPath : '.';
+        return if (resolvedPath.len > 0) resolvedPath else ".";
+    }
+
+    // Based on Node's path.win32.resolve
+    // https://github.com/nodejs/node/blob/6ae20aa63de78294b18d5015481485b7cd8fbb60/lib/path.js#L162
+    fn resolveWindows(paths: []const []const u8) []const u8 {
+        var resolvedDevice: []const u8 = "";
+        var resolvedTail: []const u8 = "";
+        var resolvedAbsolute: bool = false;
+        const cwd = Fs.FileSystem.instance.top_level_dir;
+
+        var arena = bun.ArenaAllocator.init(heap_allocator);
+        const arena_allocator = arena.allocator();
+        defer arena.deinit();
+
+        var i: i64 = @as(i64, @intCast(paths.len - 1));
+        while (i >= -1) : (i -= 1) {
+            var path: []const u8 = "";
+            if (i >= 0) {
+                path = paths[@as(usize, @intCast(i))];
+                // validateString is performed in fn pub resolve.
+                
+                // Skip empty entries
+                if (path.len == 0) continue;
+            } else if (resolvedDevice.len == 0) {
+                path = cwd;
+            } else {
+                // Windows has the concept of drive-specific current working
+                // directories. If we've resolved a drive letter but not yet an
+                // absolute path, get cwd for that drive, or the process cwd if
+                // the drive cwd is not available. We're sure the device is not
+                // a UNC path at this points, because UNC paths are always absolute.
+
+                // Translated from the following JS code:
+                // path = process.env[`=${resolvedDevice}`] || process.cwd();
+                var envPath: ?[]const u8 = null;
+                {
+                    var buf: bun.PathBuffer = undefined;
+                    @memcpy(buf[0..1], "=");
+                    @memcpy(buf[1 .. resolvedDevice.len], resolvedDevice);
+                    envPath = std.process.getEnvVarOwned(arena_allocator, buf[0.. resolvedDevice.len + 1]) catch null orelse null;
+                }
+                if (envPath != null) {
+                    path = envPath.?;
+                    defer arena_allocator.free(envPath.?);
+                }
+
+                // Verify that a cwd was found and that it actually points
+                // to our drive. If not, default to the drive's root.
+                if (
+                    envPath == null or 
+                    !std.ascii.eqlIgnoreCase(path[0 ..2], resolvedDevice) or 
+                    path[2] != '\\'
+                ) {
+                    // Translated from the following JS code:
+                    // path = `${resolvedDevice}\\`;
+                    var buf: bun.PathBuffer = undefined;
+                    var bufOffset: usize = 0;
+                    var bufSize: usize = resolvedDevice.len;
+                    @memcpy(buf[bufOffset ..bufSize], resolvedDevice);
+                    bufOffset = bufSize;
+                    bufSize += 1;
+                    @memcpy(buf[bufOffset ..bufSize], "\\");
+                    path = buf[0 ..];
+                }
+            }
+
+            const len = path.len;
+            var rootEnd: usize = 0;
+            var device: []const u8 = "";
+            // Prefix with _ to avoid shadowing the identifier in the outer scope.
+            var _isAbsolute: bool = false;
+            const byte0 = path[0];
+
+            // Try to match a root
+            if (len == 1) {
+                if (isSepAny(byte0)) {
+                    // `path` contains just a path separator
+                    rootEnd = 1;
+                    _isAbsolute = true;
+                }
+            } else if (isSepAny(byte0)) {
+                // Possible UNC root
+
+                // If we started with a separator, we know we at least have an
+                // absolute path of some kind (UNC or otherwise)
+                _isAbsolute = true;
+
+                if (isSepAny(path[1])) {
+                    // Matched double path separator at the beginning
+                    var j: usize = 2;
+                    var last: usize = j;
+
+                    // Match 1 or more non-path separators
+                    while (j < len and !isSepAny(path[j])) : (j += 1) {}
+
+                    if (j < len and j != last) {
+                        const firstPart = path[last .. j];
+
+                        // Matched!
+                        last = j;
+
+                        // Match 1 or more path separators
+                        while (j < len and isSepAny(path[j])) : (j += 1) {}
+
+                        if (j < len and j != last) {
+                            // Matched!
+                            last = j;
+
+                            // Match 1 or more non-path separators
+                            while (j < len and !isSepAny(path[j])) : (j += 1) {}
+
+                            if (j == len or j != last) {
+                                // We matched a UNC root
+
+                                // Translated from the following JS code:
+                                // device = `\\\\${firstPart}\\${StringPrototypeSlice(path, last, j)}`;
+                                var buf: bun.PathBuffer = undefined;
+                                var bufOffset: usize = 0;
+                                var bufSize: usize = 2;
+                                @memcpy(buf[bufOffset ..bufSize], "\\\\");
+                                bufOffset = bufSize;
+                                bufSize += firstPart.len;
+                                @memcpy(buf[bufOffset ..bufSize], firstPart);
+                                bufOffset = bufSize;
+                                bufSize += 1;
+                                @memcpy(buf[bufOffset ..bufSize], "\\");
+                                const segment = path[last .. j];
+                                bufOffset = bufSize;
+                                bufSize += segment.len;
+                                @memcpy(buf[bufOffset ..bufSize], segment);
+                                device = buf[0..];
+                                rootEnd = j;
+                            }
+                        }
+                    }
+                } else {
+                    rootEnd = 1;
+                }
+            } else if (isWindowsDeviceRoot(byte0) and path[1] == ':') {
+                // Possible device root
+                device = path[0..2];
+                rootEnd = 2;
+
+                if (len > 2 and isSepAny(path[2])) {
+                    // Treat separator following the drive name as an absolute path indicator
+                    _isAbsolute = true;
+                    rootEnd = 3;
+                }
+            }
+
+            if (device.len > 0) {
+                if (resolvedDevice.len > 0) {
+                    if (!std.ascii.eqlIgnoreCase(device, resolvedDevice)) {
+                        // This path points to another device, so it is not applicable
+                        continue;
+                    }
+                } else {
+                    resolvedDevice = device;
+                }
+            }
+
+            if (resolvedAbsolute) {
+                if (resolvedDevice.len > 0) break;
+            } else {
+                // Translated from the following JS code:
+                // resolvedTail = `${StringPrototypeSlice(path, rootEnd)}\\${resolvedTail}`;
+                const segment = path[rootEnd ..]; 
+                var buf: bun.PathBuffer = undefined;
+                var bufOffset: usize = 0;
+                var bufSize: usize = segment.len;
+                @memcpy(buf[bufOffset ..bufSize], segment);
+                bufOffset = bufSize;
+                bufSize += 1;
+                @memcpy(buf[bufOffset ..bufSize], "\\");
+                bufOffset = bufSize;
+                bufSize += resolvedTail.len;
+                @memcpy(buf[bufOffset ..bufSize], resolvedTail);
+                resolvedTail = buf[0 ..];
+                resolvedAbsolute = _isAbsolute;
+
+                if (_isAbsolute and resolvedDevice.len > 0) {
+                    break;
+                }
+            }
+        }
+
+        // At this point, the path should be resolved to a full absolute path,
+        // but handle relative paths to be safe (might happen when std.process.cwdAlloc()
+        // fails)
+
+        // Normalize the tail path
+        resolvedTail = std.fs.path.resolveWindows(arena_allocator, &.{ resolvedTail }) catch "";
+        defer arena_allocator.free(resolvedTail);
+
+        // Translated from the following JS code:
+        // resolvedAbsolute ? `${resolvedDevice}\\${resolvedTail}`
+        if (resolvedAbsolute) {
+            var buf: bun.PathBuffer = undefined;
+            var bufOffset: usize = 0;
+            var bufSize: usize = resolvedDevice.len;
+            @memcpy(buf[bufOffset ..bufSize], resolvedDevice);
+            bufOffset = bufSize;
+            bufSize += 1;
+            @memcpy(buf[bufOffset ..bufSize], "\\");
+            bufOffset = bufSize;
+            bufSize += resolvedTail.len;
+            @memcpy(buf[bufOffset ..bufSize], resolvedTail);
+            return buf[0 ..];
+        }
+        // Translated from the following JS code:
+        // : `${resolvedDevice}${resolvedTail}` || '.'
+        if ((resolvedDevice.len + resolvedTail.len) > 0) {
+            var buf: bun.PathBuffer = undefined;
+            var bufOffset: usize = 0;
+            var bufSize: usize = resolvedDevice.len;
+            @memcpy(buf[bufOffset ..bufSize], resolvedDevice);
+            bufOffset = bufSize;
+            bufSize += resolvedTail.len;
+            @memcpy(buf[bufOffset ..bufSize], resolvedTail);
+            return buf[0 ..];
+        }
+        return ".";
+    }
+
+    pub fn resolve(globalThis: *JSC.JSGlobalObject, isWindows: bool, args_ptr: [*]JSC.JSValue, args_len: u16) callconv(.C) JSC.JSValue {
+        if (comptime is_bindgen) return JSC.JSValue.jsUndefined();
+
+        var arena = bun.ArenaAllocator.init(heap_allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+        var stack_fallback_allocator = std.heap.stackFallback(
+            (32 * @sizeOf(string)),
+            heap_allocator,
+        );
+        var allocator = stack_fallback_allocator.get();
+        var paths = allocator.alloc(string, args_len) catch unreachable;
+        defer allocator.free(paths);
+
+        var i: usize = 0;
+        while (i < args_len) : (i += 1) {
+            const pathJSValue = args_ptr[i];
+            // Doesn't throw an exception in zig. It does trigger it in JS land.
+            validateString(globalThis, pathJSValue, "paths[{d}]", .{i}) catch {};
+            paths[i] = pathJSValue.toSlice(globalThis, arena_allocator).slice();
+        }
+        const out = if (isWindows) @This().resolveWindows(paths) else @This().resolvePosix(paths);
+        return JSC.ZigString.init(out).withEncoding().toValueGC(globalThis);
+    }
+
+    // Based on Node's path.win32.toNamespacedPath:
+    // https://github.com/nodejs/node/blob/6ae20aa63de78294b18d5015481485b7cd8fbb60/lib/path.js#L622
+    fn toNamespacedPathWindows(path: []const u8) []const u8 {
+        const resolvedPath = @This().resolveWindows(&.{ path });
+        if (resolvedPath.len <= 2) {
+            return path;
+        }
+        const byte0 = resolvedPath[0];
+        if (byte0 == std.fs.path.sep) {
+            const byte1 = resolvedPath[1];
+            const byte2 = resolvedPath[2];
+            // Possible UNC root
+            if (resolvedPath[1] == '\\') {
+                if (byte2 != '?' and byte2 != '.') {
+                    // Matched non-long UNC root, convert the path to a long UNC path
+
+                    // Translated from the following JS code:
+                    // return `\\\\?\\UNC\\${StringPrototypeSlice(resolvedPath, 2)}`;
+                    const root = "\\\\?\\UNC\\";
+                    const segment = resolvedPath[2 ..];
+                    var buf: bun.PathBuffer = undefined;
+                    var bufOffset: usize = 0;
+                    var bufSize: usize = root.len;
+                    @memcpy(buf[bufOffset .. bufSize], root);
+                    bufOffset = bufSize;
+                    bufSize += segment.len;
+                    @memcpy(buf[bufOffset .. bufSize], segment);
+                    return buf[0.. ];
+                }
+             } else if (
+                isWindowsDeviceRoot(byte0) and
+                byte1 == ':' and
+                byte2 == '\\'
+              ) {
+                // Matched device root, convert the path to a long UNC path
+
+                // Translated from the following JS code:
+                // return `\\\\?\\${resolvedPath}`
+                const root = "\\\\?\\";
+                var buf: bun.PathBuffer = undefined;
+                var bufOffset: usize = 0;
+                var bufSize: usize = root.len;
+                @memcpy(buf[bufOffset .. bufSize], root);
+                bufOffset = bufSize;
+                bufSize += resolvedPath.len;
+                @memcpy(buf[bufOffset .. bufSize], resolvedPath);
+                return buf[0.. ];
+            }
+        }
+        return path;
+    }
+
+    pub fn toNamespacedPath(globalThis: *JSC.JSGlobalObject, isWindows: bool, args_ptr: [*]JSC.JSValue, args_len: u16) callconv(.C) JSC.JSValue {
+        if (comptime is_bindgen) return JSC.JSValue.jsUndefined();
+        if (args_len == 0) return JSC.JSValue.jsUndefined();
+        var arguments: []JSC.JSValue = args_ptr[0 ..args_len];
+        // Act as an identity function for non-string values and non-Windows platforms.
+        if (!isWindows or !arguments[0].isString()) return arguments[0];
+
+        var stack_fallback = std.heap.stackFallback(4096, JSC.getAllocator(globalThis));
+        const allocator = stack_fallback.get();
+        
+        var path = arguments[0].toSlice(globalThis, allocator);
+        defer path.deinit();
+        if (path.len == 0) return arguments[0];
+        return JSC.ZigString.init(@This().toNamespacedPathWindows(path.slice())).withEncoding().toValueGC(globalThis);
     }
 
     pub const Export = shim.exportFunctions(.{
@@ -2372,6 +2788,7 @@ pub const Path = struct {
         .parse = parse,
         .relative = relative,
         .resolve = resolve,
+        .toNamespacedPath = toNamespacedPath,
     });
 
     pub const Extern = [_][]const u8{"create"};
@@ -2408,6 +2825,9 @@ pub const Path = struct {
             @export(Path.resolve, .{
                 .name = Export[9].symbol_name,
             });
+            @export(Path.toNamespacedPath, .{
+                .name = Export[10].symbol_name,
+            });
         }
     }
 };
@@ -2418,7 +2838,7 @@ pub const Process = struct {
     }
 
     pub fn getExecPath(globalObject: *JSC.JSGlobalObject) callconv(.C) JSC.JSValue {
-        var buf: [bun.MAX_PATH_BYTES]u8 = undefined;
+        var buf: bun.PathBuffer = undefined;
         const out = std.fs.selfExePath(&buf) catch {
             // if for any reason we are unable to get the executable path, we just return argv[0]
             return getArgv0(globalObject);
@@ -2531,7 +2951,7 @@ pub const Process = struct {
     }
 
     pub fn getCwd(globalObject: *JSC.JSGlobalObject) callconv(.C) JSC.JSValue {
-        var buffer: [bun.MAX_PATH_BYTES]u8 = undefined;
+        var buffer: bun.PathBuffer = undefined;
         switch (Syscall.getcwd(&buffer)) {
             .err => |err| {
                 return err.toJSC(globalObject);
@@ -2551,7 +2971,7 @@ pub const Process = struct {
             return JSC.toInvalidArguments("path is required", .{}, globalObject.ref());
         }
 
-        var buf: [bun.MAX_PATH_BYTES]u8 = undefined;
+        var buf: bun.PathBuffer = undefined;
         const slice = to.sliceZBuf(&buf) catch {
             return JSC.toInvalidArguments("Invalid path", .{}, globalObject.ref());
         };

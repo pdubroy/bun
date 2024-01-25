@@ -1261,15 +1261,15 @@ fn _joinAbsStringBufWindows(
 }
 
 pub fn isSepPosix(char: u8) bool {
-    return char == std.fs.path.sep_posix;
+    return char == '/';
 }
 
 pub fn isSepWin32(char: u8) bool {
-    return char == std.fs.path.sep_windows;
+    return char == '\\';
 }
 
 pub fn isSepAny(char: u8) bool {
-    return @call(.always_inline, isSepPosix, .{char}) or @call(.always_inline, isSepWin32, .{char});
+    return char == '/' or char == '\\';
 }
 
 pub fn lastIndexOfSeparatorWindows(slice: []const u8) ?usize {
