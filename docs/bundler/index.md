@@ -1235,32 +1235,34 @@ interface Bun {
   build(options: BuildOptions): Promise<BuildOutput>;
 }
 
-interface BuildOptions {
-  entrypoints: string[]; // required
-  outdir?: string; // default: no write (in-memory only)
-  format?: "esm"; // later: "cjs" | "iife"
-  target?: "browser" | "bun" | "node"; // "browser"
-  splitting?: boolean; // true
-  plugins?: BunPlugin[]; // [] // See https://bun.sh/docs/bundler/plugins
-  loader?: { [k in string]: Loader }; // See https://bun.sh/docs/bundler/loaders
-  manifest?: boolean; // false
-  external?: string[]; // []
-  sourcemap?: "none" | "inline" | "external"; // "none"
-  root?: string; // computed from entrypoints
+interface BuildConfig {
+  entrypoints: string[]; // list of file path
+  outdir?: string; // output directory
+  target?: Target; // default: "browser"
+  format?: ModuleFormat; // later: "cjs", "iife"
   naming?:
     | string
     | {
-        entry?: string; // '[dir]/[name].[ext]'
-        chunk?: string; // '[name]-[hash].[ext]'
-        asset?: string; // '[name]-[hash].[ext]'
-      };
-  publicPath?: string; // e.g. http://mydomain.com/
+        chunk?: string;
+        entry?: string;
+        asset?: string;
+      }; // | string;
+  root?: string; // project root
+  splitting?: boolean; // default true, enable code splitting
+  plugins?: BunPlugin[];
+  // manifest?: boolean; // whether to return manifest
+  external?: string[];
+  publicPath?: string;
+  define?: Record<string, string>;
+  // origin?: string; // e.g. http://mydomain.com
+  loader?: { [k in string]: Loader };
+  sourcemap?: "none" | "inline" | "external"; // default: "none"
   minify?:
-    | boolean // false
+    | boolean
     | {
-        identifiers?: boolean;
         whitespace?: boolean;
         syntax?: boolean;
+        identifiers?: boolean;
       };
 }
 
